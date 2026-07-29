@@ -1,0 +1,712 @@
+name: Smart Proxy IP Checker
+
+on:
+  schedule:
+    - cron: '5 */1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+
+      - name: Run direct TCP+TLS+SNI proxy checker
+        env:
+          # ===== 用户配置区域 =====
+          COUNTRY_LIMIT: "US,DE,GB,JP,SG,HK,KR,TW,NL"
+          SAMPLE_PER_COUNTRY: "50"
+          IPS_PER_COUNTRY: "10"
+          SOURCE_URL_TXT: "https://zip.cm.edu.kg/all.txt"
+          SOURCE_URL_CSV: "https://raw.githubusercontent.com/xgonce/Cloudflare_IP/main/result.csv"
+          FULL_LIST_FILE: "ip-all.txt"
+          PREFER_FILE: "prefecthip.txt"
+          OUTPUT_FILE: "proxyip.txt"
+          PURE_OUTPUT_FILE: "pureip.txt"
+          # 轮询分发接口配置
+          CHECK_API_URLS: "https://ckp.ivp.cc.cd/check,https://ckp.vsp.cc.cd/check,https://ckp.soe.cc.cd/check,https://ckp2.ivp.cc.cd/check,https://ckp.seapu.dpdns.org/check,https://ckp.nrtpu.dpdns.org/check,https://ckp.lzgd.fun/check,https://vl.lzgd.dpdns.org/check,https://ckp.lzgd.dpdns.org/check"
+          BATCH_SIZE: "20"
+          FRAUD_THRESHOLD: "30"
+          REQUEST_TIMEOUT: "60"
+          HEALTH_CHECK_TIMEOUT: "10"  # 健康检查超时时间（秒）
+          # Custom probe domains (deploy probe_server.py, replace with your own)
+          # PROBE_IPV4_HOST: "ipv4.your-domain.com"
+          # PROBE_IPV6_HOST: "ipv6.your-domain.com"
+          # PROBE_IPPURE_HOST: "my.ippure.com"
+          # 认证密码
+          CHECK_PASSWORD: ${{ secrets.CHECK_PASSWORD }}
+          # ===== 配置结束 =====
+        run: |
+          python - << 'EOF'
+          import requests
+          import time
+          import os
+          import sys
+          import random
+          import pandas as pd
+          from collections import defaultdict
+          from io import StringIO
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          sys.path.insert(0, os.getcwd())
+          import direct_check
+
+          # ---------- 读取配置 ----------
+          COUNTRY_LIMIT = [c.strip() for c in os.environ.get('COUNTRY_LIMIT', 'US,DE,GB,JP,SG,HK,KR,TW,NL').split(',') if c.strip()]
+          SAMPLE_PER_COUNTRY = int(os.environ.get('SAMPLE_PER_COUNTRY', '50'))
+          IPS_PER_COUNTRY = int(os.environ.get('IPS_PER_COUNTRY', '10'))
+          SOURCE_URL_TXT = os.environ.get('SOURCE_URL_TXT')
+          SOURCE_URL_CSV = os.environ.get('SOURCE_URL_CSV')
+          FULL_LIST_FILE = os.environ.get('FULL_LIST_FILE', 'ip-all.txt')
+          PREFER_FILE = os.environ.get('PREFER_FILE', 'prefecthip.txt')
+          OUTPUT_FILE = os.environ.get('OUTPUT_FILE', 'proxyip.txt')
+          PURE_OUTPUT_FILE = os.environ.get('PURE_OUTPUT_FILE', 'pureip.txt')
+
+          # 轮询分发配置
+          CHECK_API_URLS = [url.strip() for url in os.environ.get('CHECK_API_URLS', '').split(',') if url.strip()]
+          BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
+          FRAUD_THRESHOLD = int(os.environ.get('FRAUD_THRESHOLD', '30'))
+          REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '60'))
+          HEALTH_CHECK_TIMEOUT = int(os.environ.get('HEALTH_CHECK_TIMEOUT', '10'))
+
+          # 认证密码
+          CHECK_PASSWORD = os.environ.get('CHECK_PASSWORD', '').strip()
+          # ---------- 配置结束 ----------
+
+          if not CHECK_API_URLS:
+              print("❌ 错误: 未配置任何检测接口 (CHECK_API_URLS)")
+              sys.exit(1)
+
+          if CHECK_PASSWORD:
+              print(f"🔐 已配置检测接口密码 (长度: {len(CHECK_PASSWORD)} 字符)")
+          else:
+              print("⚠️ 警告: 未配置检测接口密码 (CHECK_PASSWORD)，如果接口需要认证可能会失败")
+
+          print(f"📡 已配置 {len(CHECK_API_URLS)} 个检测接口")
+
+          def fetch_and_save_full_list():
+              """从TXT源获取完整IP列表并保存"""
+              print(f"📥 正在从 {SOURCE_URL_TXT} 获取完整IP列表...")
+              try:
+                  resp = requests.get(SOURCE_URL_TXT, timeout=30)
+                  if resp.status_code != 200:
+                      print(f"❌ 获取失败，状态码: {resp.status_code}")
+                      return False
+                  with open(FULL_LIST_FILE, 'w', encoding='utf-8') as f:
+                      f.write(resp.text)
+                  print(f"✅ 已保存 {len(resp.text.splitlines())} 条记录到 {FULL_LIST_FILE}")
+                  return True
+              except Exception as e:
+                  print(f"❌ 获取异常: {e}")
+                  return False
+
+          def fetch_performance_csv():
+              """从CSV源获取带性能数据的IP列表，并自动识别列名"""
+              print(f"📥 正在从 {SOURCE_URL_CSV} 获取性能数据...")
+              try:
+                  resp = requests.get(SOURCE_URL_CSV, timeout=30)
+                  if resp.status_code != 200:
+                      print(f"❌ 获取CSV失败，状态码: {resp.status_code}")
+                      return None
+
+                  df = pd.read_csv(StringIO(resp.text))
+                  df.columns = df.columns.str.strip()
+                  print(f"✅ 成功获取 {len(df)} 条性能记录")
+                  print(f"📋 CSV清理后的列名: {df.columns.tolist()}")
+
+                  col_mapping = {}
+                  for col in df.columns:
+                      col_clean = col.strip()
+                      col_lower = col_clean.lower()
+
+                      if 'cf归属国' in col_clean or 'cf归属国' in col_lower:
+                          col_mapping['country'] = col_clean
+                      elif 'country' in col_lower or '国家' in col_clean:
+                          col_mapping['country'] = col_clean
+                      elif 'cf-meta-ip' in col_lower or 'ip' in col_lower or '地址' in col_clean:
+                          col_mapping['ip'] = col_clean
+                      elif 'port' in col_lower or '端口' in col_clean:
+                          col_mapping['port'] = col_clean
+                      elif 'speed' in col_lower or '速度' in col_clean:
+                          col_mapping['speed'] = col_clean
+                      elif 'tcp' in col_lower and ('延迟' in col_clean or 'latency' in col_lower):
+                          col_mapping['tcp_latency'] = col_clean
+                      elif 'tls' in col_lower and ('延迟' in col_clean or 'latency' in col_lower):
+                          col_mapping['tls_latency'] = col_clean
+
+                  print(f"🔍 自动识别的列名映射: {col_mapping}")
+
+                  if 'country' not in col_mapping:
+                      print("⚠️ 未找到国家列，将使用第一列作为国家列")
+                      col_mapping['country'] = df.columns[0]
+
+                  if 'ip' not in col_mapping:
+                      print("⚠️ 未找到IP列，尝试自动识别...")
+                      for col in df.columns:
+                          if '.' in str(df[col].iloc[0]) or ':' in str(df[col].iloc[0]):
+                              col_mapping['ip'] = col
+                              break
+                      if 'ip' not in col_mapping:
+                          print("❌ 无法识别IP列")
+                          return None
+
+                  return df, col_mapping
+              except Exception as e:
+                  print(f"❌ 解析CSV异常: {e}")
+                  return None
+
+          def parse_ip_line(line):
+              """解析TXT单行，返回 (ip, port, country)"""
+              line = line.strip()
+              if not line or '#' not in line:
+                  return None
+              try:
+                  ip_port, country = line.split('#')
+                  ip, port = ip_port.split(':')
+                  return {'ip': ip, 'port': port, 'country': country.strip()}
+              except:
+                  return None
+
+          def load_ip_list_from_file(filename):
+              """从TXT文件加载IP列表"""
+              if not os.path.exists(filename):
+                  return []
+              entries = []
+              with open(filename, 'r', encoding='utf-8') as f:
+                  for line in f:
+                      parsed = parse_ip_line(line)
+                      if parsed:
+                          entries.append(parsed)
+              return entries
+
+          def save_ip_list_to_file(filename, entries):
+              """保存IP列表到TXT文件"""
+              with open(filename, 'w', encoding='utf-8') as f:
+                  for entry in entries:
+                      f.write(f"{entry['ip']}:{entry['port']}#{entry['country']}\n")
+
+          def group_by_country(entries):
+              """按国家分组"""
+              groups = defaultdict(list)
+              for entry in entries:
+                  groups[entry['country']].append(entry)
+              return groups
+
+          def select_top_ips_from_csv(df, col_mapping, country, limit=50):
+              """从CSV数据中为指定国家选择性能最优的IP"""
+              country_col = col_mapping.get('country')
+              if country_col not in df.columns:
+                  print(f"  ❌ 国家列 '{country_col}' 不存在于DataFrame中")
+                  return []
+
+              country_series = df[country_col].astype(str).str.strip()
+              country_mask = country_series.str.upper() == country.upper()
+              country_df = df[country_mask].copy()
+
+              if country_df.empty:
+                  print(f"  ⚠️ CSV中未找到 {country} 的数据")
+                  return []
+
+              print(f"  📊 在CSV中找到 {len(country_df)} 条 {country} 记录")
+
+              ip_col = col_mapping.get('ip')
+              if ip_col is None or ip_col not in df.columns:
+                  print(f"  ❌ IP列 '{ip_col}' 不存在")
+                  return []
+
+              port_col = col_mapping.get('port')
+              if port_col is None or port_col not in df.columns:
+                  port_col = None
+
+              speed_col = col_mapping.get('speed')
+              tcp_col = col_mapping.get('tcp_latency')
+              tls_col = col_mapping.get('tls_latency')
+
+              result = []
+              for _, row in country_df.iterrows():
+                  ip = str(row[ip_col]).strip()
+                  if not ip or ip == 'nan':
+                      continue
+
+                  port = '443'
+                  if port_col and pd.notna(row[port_col]):
+                      port = str(row[port_col]).strip()
+
+                  speed = 0
+                  if speed_col and pd.notna(row[speed_col]):
+                      try:
+                          speed = float(row[speed_col])
+                      except:
+                          pass
+
+                  tcp_latency = 9999
+                  if tcp_col and pd.notna(row[tcp_col]):
+                      try:
+                          tcp_latency = float(row[tcp_col])
+                      except:
+                          pass
+
+                  tls_latency = 9999
+                  if tls_col and pd.notna(row[tls_col]):
+                      try:
+                          tls_latency = float(row[tls_col])
+                      except:
+                          pass
+
+                  result.append({
+                      'ip': ip,
+                      'port': port,
+                      'country': country,
+                      'speed': speed,
+                      'tcp_latency': tcp_latency,
+                      'tls_latency': tls_latency
+                  })
+
+              if not result:
+                  return []
+
+              max_speed = max([r['speed'] for r in result]) if result else 1
+              min_tcp = min([r['tcp_latency'] for r in result])
+              min_tls = min([r['tls_latency'] for r in result])
+              tcp_range = max(1, max([r['tcp_latency'] for r in result]) - min_tcp)
+              tls_range = max(1, max([r['tls_latency'] for r in result]) - min_tls)
+
+              for r in result:
+                  speed_score = r['speed'] / max_speed if max_speed > 0 else 0
+                  tcp_score = 1 - (r['tcp_latency'] - min_tcp) / tcp_range if tcp_range > 0 else 0
+                  tls_score = 1 - (r['tls_latency'] - min_tls) / tls_range if tls_range > 0 else 0
+                  r['score'] = 0.5 * speed_score + 0.3 * tcp_score + 0.2 * tls_score
+
+              result.sort(key=lambda x: x['score'], reverse=True)
+              top_result = result[:limit]
+              print(f"  ✅ 从CSV中为 {country} 选出 {len(top_result)} 个最优IP")
+              return top_result
+
+          def format_ip_port(ip, port):
+              """格式化 IP:PORT，支持IPv6"""
+              if ':' in ip and not ip.startswith('[') and ip.count(':') >= 2:
+                  return f"[{ip}]:{port}"
+              return f"{ip}:{port}"
+
+          def extract_fraud_score(probe_results):
+              """从 probe_results 中提取 fraudScore"""
+              if not probe_results:
+                  return None
+              ipv4 = probe_results.get('ipv4', {})
+              if ipv4.get('ok') and ipv4.get('exit'):
+                  ippure = ipv4['exit'].get('ippure', {})
+                  if ippure and 'fraudScore' in ippure:
+                      return ippure['fraudScore']
+              ipv6 = probe_results.get('ipv6', {})
+              if ipv6.get('ok') and ipv6.get('exit'):
+                  ippure = ipv6['exit'].get('ippure', {})
+                  if ippure and 'fraudScore' in ippure:
+                      return ippure['fraudScore']
+              return None
+
+          def health_check_single_endpoint(endpoint_url, timeout):
+              """
+              检测单个接口是否可用
+              返回: (is_healthy, error_message, response_time)
+              """
+              try:
+                  # 使用简单的健康检查：发送一个包含单个测试IP的请求
+                  test_payload = {"targets": ["1.1.1.1:443"]}
+                  headers = {'Content-Type': 'application/json'}
+                  if CHECK_PASSWORD:
+                      headers['X-Page-Password'] = CHECK_PASSWORD
+
+                  start_time = time.time()
+                  resp = requests.post(endpoint_url, json=test_payload, headers=headers, timeout=timeout)
+                  elapsed = time.time() - start_time
+
+                  if resp.status_code == 200:
+                      return (True, None, elapsed)
+                  elif resp.status_code == 401:
+                      return (False, f"认证失败 (HTTP 401)，请检查密码", elapsed)
+                  else:
+                      return (False, f"HTTP {resp.status_code}", elapsed)
+
+              except requests.exceptions.Timeout:
+                  return (False, f"超时 ({timeout}s)", timeout)
+              except requests.exceptions.ConnectionError:
+                  return (False, "连接失败", None)
+              except Exception as e:
+                  return (False, f"异常: {e}", None)
+
+          def batch_check_single_endpoint(endpoint_url, ip_port_list, timeout):
+              """
+              调用单个检测接口进行批量检测，携带密码认证
+              返回: 字典 { "IP:PORT": {"success": bool, "fraudScore": int, "data": dict} }
+              """
+              if not ip_port_list:
+                  return {}
+
+              try:
+                  payload = {"targets": ip_port_list}
+                  headers = {'Content-Type': 'application/json'}
+                  if CHECK_PASSWORD:
+                      headers['X-Page-Password'] = CHECK_PASSWORD
+
+                  start_time = time.time()
+                  resp = requests.post(endpoint_url, json=payload, headers=headers, timeout=timeout)
+                  elapsed = time.time() - start_time
+
+                  if resp.status_code != 200:
+                      print(f"     ❌ 请求失败 (HTTP {resp.status_code})")
+                      if resp.status_code == 401:
+                          print(f"        ⚠️ 认证失败，请检查 CHECK_PASSWORD 是否正确")
+                      return {}
+
+                  result_data = resp.json()
+                  print(f"     ✅ 响应成功 (耗时: {elapsed:.2f}s)")
+
+                  if isinstance(result_data, dict) and result_data.get('error') == 'Unauthorized':
+                      print(f"        ⚠️ 接口返回认证错误，请检查 CHECK_PASSWORD")
+                      return {}
+
+                  parsed = {}
+                  if isinstance(result_data, dict):
+                      results = result_data.get('results', [])
+                      if not results and 'candidate' in result_data:
+                          results = [result_data]
+
+                      for item in results:
+                          candidate = item.get('candidate', '')
+                          if not candidate:
+                              proxy_ip = item.get('proxyIP', '')
+                              port = item.get('portRemote', 443)
+                              if proxy_ip:
+                                  candidate = f"{proxy_ip}:{port}"
+
+                          if candidate:
+                              is_success = item.get('success', False)
+                              fraud_score = extract_fraud_score(item.get('probe_results', {}))
+                              parsed[candidate] = {
+                                  'success': bool(is_success),
+                                  'fraudScore': fraud_score,
+                                  'data': item
+                              }
+
+                  return parsed
+
+              except requests.exceptions.Timeout:
+                  print(f"     ❌ 超时 ({timeout}s)")
+                  return {}
+              except requests.exceptions.ConnectionError:
+                  print(f"     ❌ 连接失败")
+                  return {}
+              except Exception as e:
+                  print(f"     ❌ 异常: {e}")
+                  return {}
+
+          def main():
+              # 1. 更新完整IP库
+              if not fetch_and_save_full_list():
+                  print("⚠️ 无法获取TXT列表，将使用本地缓存")
+                  if not os.path.exists(FULL_LIST_FILE):
+                      print("❌ 本地缓存不存在，无法继续")
+                      sys.exit(1)
+
+              # 2. 加载完整IP库
+              all_entries = load_ip_list_from_file(FULL_LIST_FILE)
+              all_groups = group_by_country(all_entries) if all_entries else {}
+              print(f"📂 从 ip-all.txt 加载了 {len(all_entries)} 个IP")
+
+              # 3. 获取CSV性能数据
+              csv_data = fetch_performance_csv()
+              if csv_data is None:
+                  print("⚠️ 无法获取CSV数据，将仅使用TXT源")
+                  perf_df = None
+                  col_mapping = {}
+              else:
+                  perf_df, col_mapping = csv_data
+
+              # 4. 构建预选IP池
+              preferred_entries = []
+              print(f"\n🌍 开始为 {len(COUNTRY_LIMIT)} 个国家构建预选池: {COUNTRY_LIMIT}")
+
+              for country in COUNTRY_LIMIT:
+                  print(f"\n{'='*50}")
+                  print(f"🇨🇳 处理国家: {country}")
+
+                  country_preferred = []
+
+                  if perf_df is not None:
+                      csv_ips = select_top_ips_from_csv(perf_df, col_mapping, country, SAMPLE_PER_COUNTRY)
+                      if csv_ips:
+                          country_preferred.extend(csv_ips)
+                          print(f"  ✅ 从CSV获取 {len(csv_ips)} 个性能最优IP")
+                      else:
+                          print(f"  ⚠️ CSV中无 {country} 数据或解析失败")
+
+                  if len(country_preferred) < SAMPLE_PER_COUNTRY:
+                      needed = SAMPLE_PER_COUNTRY - len(country_preferred)
+                      if country in all_groups and all_groups[country]:
+                          selected_ips = {e['ip'] for e in country_preferred}
+                          additional = [e for e in all_groups[country] if e['ip'] not in selected_ips]
+                          if additional:
+                              add_count = min(needed, len(additional))
+                              add_ips = random.sample(additional, add_count)
+                              for e in add_ips:
+                                  country_preferred.append({
+                                      'ip': e['ip'],
+                                      'port': e['port'],
+                                      'country': country,
+                                      'speed': 0,
+                                      'tcp_latency': 9999,
+                                      'tls_latency': 9999
+                                  })
+                              print(f"  📥 从 ip-all.txt 补充 {len(add_ips)} 个IP")
+                          else:
+                              print(f"  ⚠️ ip-all.txt 中没有可补充的IP")
+                      else:
+                          print(f"  ⚠️ ip-all.txt 中无 {country} 数据")
+
+                  if not country_preferred:
+                      print(f"  ❌ 国家 {country} 没有任何IP，跳过")
+                      continue
+
+                  preferred_entries.extend(country_preferred)
+                  print(f"  📌 {country} 预选池总计: {len(country_preferred)} 个IP")
+
+              # 5. 保存预选IP
+              save_ip_list_to_file(PREFER_FILE, preferred_entries)
+              print(f"\n💾 已保存 {len(preferred_entries)} 个预选IP到 {PREFER_FILE}")
+
+              # 6. 构建所有待检测的 IP:PORT 列表
+              ip_port_list = []
+              ip_entry_map = {}
+              for entry in preferred_entries:
+                  ip_port = format_ip_port(entry['ip'], entry['port'])
+                  ip_port_list.append(ip_port)
+                  ip_entry_map[ip_port] = entry
+
+              total_ips = len(ip_port_list)
+              print(f"\n📊 总计 {total_ips} 个IP需要检测")
+
+              # ================= 7. TCP+TLS+SNI direct probe (no external API) =================
+              all_check_results = {}
+              all_success_entries = []
+              pure_entries = []
+
+              print(f"\n{'='*50}")
+              print(f"Direct proxy check: {total_ips} IPs, concurrency=3, timeout={REQUEST_TIMEOUT}s ...")
+
+              for i in range(0, total_ips, BATCH_SIZE):
+                  batch = ip_port_list[i:i+BATCH_SIZE]
+                  batch_num = i // BATCH_SIZE + 1
+                  total_batches = (total_ips - 1) // BATCH_SIZE + 1
+
+                  print(f"\n  Batch {batch_num}/{total_batches}: checking {len(batch)} IPs directly ...")
+
+                  batch_results = direct_check.batch_check(
+                      batch, concurrency=3, timeout=REQUEST_TIMEOUT, verbose=False
+                  )
+
+                  for ip_port in batch:
+                      entry = ip_entry_map.get(ip_port)
+                      if not entry:
+                          continue
+
+                      result = batch_results.get(ip_port, {})
+                      is_success = result.get('success', False)
+                      fraud_score = result.get('fraudScore')
+
+                      all_check_results[ip_port] = result
+
+                      if is_success:
+                          all_success_entries.append(entry)
+                          fs = f" fraudScore:{fraud_score}" if fraud_score is not None else ""
+                          stack = result.get('data', {}).get('inferred_stack', '?')
+                          print(f"    [OK] {ip_port} valid ({stack}){fs}")
+
+                          if fraud_score is not None and 0 <= fraud_score < FRAUD_THRESHOLD:
+                              pure_entries.append({
+                                  'entry': entry,
+                                  'fraudScore': fraud_score,
+                                  'data': result.get('data', {})
+                              })
+                              print(f"       clean (fraudScore: {fraud_score})")
+                      else:
+                          print(f"    [FAIL] {ip_port}")
+
+                  if i + BATCH_SIZE < total_ips:
+                      time.sleep(0.3)
+
+              # 9. 更新 prefecthip.txt
+              save_ip_list_to_file(PREFER_FILE, all_success_entries)
+              print(f"\n📊 prefecthip.txt 更新完成: 保留 {len(all_success_entries)} 个有效反代IP")
+
+              # 10. 生成 proxyip.txt
+              print(f"\n{'='*50}")
+              print("📝 生成最终 proxyip.txt ...")
+
+              success_by_country = defaultdict(list)
+              for entry in all_success_entries:
+                  success_by_country[entry['country']].append(entry)
+
+              perf_map = {}
+              for entry in preferred_entries:
+                  perf_map[entry['ip']] = {
+                      'country': entry.get('country', ''),
+                      'speed': entry.get('speed', 0),
+                      'tcp_latency': entry.get('tcp_latency', 9999),
+                      'tls_latency': entry.get('tls_latency', 9999)
+                  }
+
+              output_lines = []
+              for country in COUNTRY_LIMIT:
+                  if country not in success_by_country:
+                      continue
+                  country_entries = success_by_country[country]
+                  country_entries.sort(key=lambda x: perf_map.get(x['ip'], {}).get('speed', 0), reverse=True)
+                  best_entries = country_entries[:IPS_PER_COUNTRY]
+
+                  for entry in best_entries:
+                      ip = entry['ip']
+                      perf = perf_map.get(ip, {})
+                      country_code = perf.get('country', country)
+                      speed = perf.get('speed', 0)
+                      tcp_lat = perf.get('tcp_latency', 9999)
+                      tls_lat = perf.get('tls_latency', 9999)
+
+                      if speed > 0:
+                        note = f"#{country_code}|{speed:.1f}Mbps|TLS{tls_lat}ms"
+                      else:
+                        note = f"#{country_code}|TLS{tls_lat}ms"
+                      output_lines.append(f"{ip}{note}")
+
+              unique_lines = list(dict.fromkeys(output_lines))
+              with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                  f.write('\n'.join(unique_lines))
+              print(f"✅ 最终 {OUTPUT_FILE} 包含 {len(unique_lines)} 个有效反代IP（含性能备注）")
+
+              # 11. 生成 pureip.txt（追加模式 + 去重 + 300条上限）
+              print(f"\n{'='*50}")
+              print(f"🔬 生成 pureip.txt (fraudScore 0-{FRAUD_THRESHOLD} 的纯净IP)...")
+
+              MAX_PURE_IPS = 300
+
+              def parse_existing_pure_line(line):
+                  """解析 pureip.txt 中的一行，返回 {ip, fraudScore, line}"""
+                  line = line.strip()
+                  if not line or line.startswith('#'):
+                      return None
+                  try:
+                      # 格式: ip#country|...|IPPure:score
+                      ip = line.split('#')[0].strip()
+                      if 'IPPure:' in line:
+                          pure_part = line.split('IPPure:')[-1].strip()
+                          fraud = int(pure_part.split('|')[0].strip())
+                      else:
+                          fraud = 999  # 无法解析则视为很高
+                      return {'ip': ip, 'fraudScore': fraud, 'line': line}
+                  except:
+                      return None
+
+              # 加载已有 pureip.txt
+              existing_pure = {}
+              if os.path.exists(PURE_OUTPUT_FILE):
+                  with open(PURE_OUTPUT_FILE, 'r', encoding='utf-8') as f:
+                      for line in f:
+                          parsed = parse_existing_pure_line(line)
+                          if parsed:
+                              existing_pure[parsed['ip']] = {
+                                  'fraudScore': parsed['fraudScore'],
+                                  'line': parsed['line']
+                              }
+                  print(f"📖 从 {PURE_OUTPUT_FILE} 加载了 {len(existing_pure)} 个已有纯净IP")
+
+              # 构建本轮新检测到的纯净IP
+              new_pure = {}
+              for item in pure_entries:
+                  entry = item['entry']
+                  fraud_score = item['fraudScore']
+                  ip = entry['ip']
+                  perf = perf_map.get(ip, {})
+                  country_code = perf.get('country', entry.get('country', ''))
+                  speed = perf.get('speed', 0)
+                  tcp_lat = perf.get('tcp_latency', 9999)
+                  tls_lat = perf.get('tls_latency', 9999)
+
+                  if speed > 0:
+                    note = f"#{country_code}|{speed:.1f}Mbps|TLS{tls_lat}ms|IPPure:{fraud_score}"
+                  else:
+                    note = f"#{country_code}|TLS{tls_lat}ms|IPPure:{fraud_score}"
+                  line = f"{ip}{note}"
+                  new_pure[ip] = {'fraudScore': fraud_score, 'line': line}
+
+              print(f"🔍 本轮检测到 {len(new_pure)} 个新纯净IP")
+
+              if not new_pure and not existing_pure:
+                  print(f"⚠️ 没有 fraudScore 在 0-{FRAUD_THRESHOLD} 之间的纯净IP")
+                  with open(PURE_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                      f.write(f"# No pure IP found (fraudScore >= {FRAUD_THRESHOLD} or no data)")
+              elif not new_pure:
+                  print(f"⚠️ 本轮无新纯净IP，{PURE_OUTPUT_FILE} 保持不变 ({len(existing_pure)} 个IP)")
+              else:
+                  # 合并：同一IP保留 fraudScore 更低的
+                  all_pure = {}
+                  for ip, info in existing_pure.items():
+                      all_pure[ip] = info
+                  for ip, info in new_pure.items():
+                      if ip in all_pure:
+                          if info['fraudScore'] < all_pure[ip]['fraudScore']:
+                              all_pure[ip] = info  # 用更纯净的替换
+                      else:
+                          all_pure[ip] = info
+
+                  print(f"📊 合并后共 {len(all_pure)} 个不重复纯净IP")
+
+                  # 超过300条时，保留 fraudScore 最低的300条
+                  if len(all_pure) > MAX_PURE_IPS:
+                      sorted_entries = sorted(all_pure.items(), key=lambda x: x[1]['fraudScore'])
+                      all_pure = dict(sorted_entries[:MAX_PURE_IPS])
+                      print(f"⚡ 已裁剪至 {MAX_PURE_IPS} 条（保留 fraudScore 最低的）")
+
+                  final_ip_set = set(all_pure.keys())
+                  kept_new = sum(1 for ip in new_pure if ip in final_ip_set)
+
+                  with open(PURE_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                      sorted_all = sorted(all_pure.items(), key=lambda x: x[1]['fraudScore'])
+                      for ip, info in sorted_all:
+                          f.write(info['line'] + '\n')
+                  print(f"✅ {PURE_OUTPUT_FILE} 更新完成: {len(all_pure)} 个纯净IP（本轮保留 {kept_new}/{len(new_pure)} 个）")
+              print("🎯 所有任务完成！")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: Commit and push changes
+        run: |
+          git add ip-all.txt prefecthip.txt proxyip.txt pureip.txt
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash
+          git diff --cached --quiet || git commit -m "Update IP lists with health check before distribution"
+          git push
+
+      - name: Push IPs to API
+        env:
+          PUSH_API_URL: ${{ secrets.PUSH_API_URL }}
+          PUSH_API_TOKEN: ${{ secrets.PUSH_API_TOKEN }}
+        run: python push_ips.py
