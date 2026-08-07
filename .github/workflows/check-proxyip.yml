@@ -81,7 +81,7 @@ jobs:
 
           # 轮询分发配置
           CHECK_API_URLS = [url.strip() for url in os.environ.get('CHECK_API_URLS', '').split(',') if url.strip()]
-          BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
+          BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '15'))
           FRAUD_THRESHOLD = int(os.environ.get('FRAUD_THRESHOLD', '10'))
           REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '60'))
           HEALTH_CHECK_TIMEOUT = int(os.environ.get('HEALTH_CHECK_TIMEOUT', '10'))
