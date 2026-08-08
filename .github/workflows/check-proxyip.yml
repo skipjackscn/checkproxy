@@ -2,7 +2,7 @@ name: Smart Proxy IP Checker
 
 on:
   schedule:
-    - cron: '53 9 * * *'
+    - cron: '56 22 * * *'
   workflow_dispatch:
 
 permissions:
@@ -44,7 +44,7 @@ jobs:
           # 轮询分发接口配置
           CHECK_API_URLS: "https://ckp.ivp.cc.cd/check,https://ckp.vsp.cc.cd/check,https://ckp.soe.cc.cd/check,https://ckp2.ivp.cc.cd/check,https://ckp.seapu.dpdns.org/check,https://ckp.nrtpu.dpdns.org/check,https://ckp.lzgd.fun/check,https://vl.lzgd.dpdns.org/check,https://ckp.lzgd.dpdns.org/check"
           BATCH_SIZE: "15"
-          FRAUD_THRESHOLD: "10"
+          FRAUD_THRESHOLD: "20"
           REQUEST_TIMEOUT: "60"
           HEALTH_CHECK_TIMEOUT: "10"  # 健康检查超时时间（秒）
           # Custom probe domains (deploy probe_server.py, replace with your own)
@@ -82,7 +82,7 @@ jobs:
           # 轮询分发配置
           CHECK_API_URLS = [url.strip() for url in os.environ.get('CHECK_API_URLS', '').split(',') if url.strip()]
           BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '15'))
-          FRAUD_THRESHOLD = int(os.environ.get('FRAUD_THRESHOLD', '10'))
+          FRAUD_THRESHOLD = int(os.environ.get('FRAUD_THRESHOLD', '20'))
           REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '60'))
           HEALTH_CHECK_TIMEOUT = int(os.environ.get('HEALTH_CHECK_TIMEOUT', '10'))
 
